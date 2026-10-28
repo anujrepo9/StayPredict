@@ -1,54 +1,83 @@
+const User = require("../models/User");
+const AuditLog = require("../models/AuditLog");
 const Admission = require("../models/Admission");
-const Prediction = require("../models/Prediction");
-const Bed = require("../models/Bed");
-const Ward = require("../models/Ward");
-const mlService = require("../services/mlService");
+const { createObjectCsvStringifier } = require("../utils/csv");
 
-exports.getOverview = async (req, res, next) => {
+exports.getUsers = async (req, res, next) => {
   try {
-    const [admissions, predictions, beds, wards] = await Promise.all([
-      Admission.find().select("status admissionDate actualLos"),
-      Prediction.find().select("predictedLosDays riskCategory prolongedStayProbability predictedAt"),
-      Bed.find().select("status wardId"),
-      Ward.find({ isActive: true }).select("name type totalBeds"),
+    const { page = 1, limit = 20 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [users, total] = await Promise.all([
+      User.find().sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)),
+      User.countDocuments(),
     ]);
-
-    // Monthly admission trend (last 6 months)
-    const now = new Date();
-    const monthlyTrend = [];
-    for (let i = 5; i >= 0; i--) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      const next = new Date(d.getFullYear(), d.getMonth() + 1, 1);
-      const label = d.toLocaleString("default", { month: "short", year: "2-digit" });
-      const count = admissions.filter(a => a.admissionDate >= d && a.admissionDate < next).length;
-      monthlyTrend.push({ month: label, admissions: count });
-    }
-
-    const losDistribution = [
-      { range: "1-3", count: predictions.filter(p => p.predictedLosDays <= 3).length },
-      { range: "4-7", count: predictions.filter(p => p.predictedLosDays > 3 && p.predictedLosDays <= 7).length },
-      { range: "8-14", count: predictions.filter(p => p.predictedLosDays > 7 && p.predictedLosDays <= 14).length },
-      { range: "15+", count: predictions.filter(p => p.predictedLosDays > 14).length },
-    ];
-
-    const wardOccupancy = await Promise.all(wards.map(async (w) => {
-      const wardBeds = beds.filter(b => String(b.wardId) === String(w._id));
-      return {
-        name: w.name,
-        type: w.type,
-        total: wardBeds.length || w.totalBeds,
-        occupied: wardBeds.filter(b => b.status === "occupied").length,
-        available: wardBeds.filter(b => b.status === "available").length,
-      };
-    }));
-
-    res.json({ monthlyTrend, losDistribution, wardOccupancy, totalPredictions: predictions.length });
+    res.json({ users, total });
   } catch (err) { next(err); }
 };
 
-exports.getModelMetrics = async (req, res, next) => {
+exports.updateUser = async (req, res, next) => {
   try {
-    const info = await mlService.getModelInfo();
-    res.json({ modelInfo: info });
+    const { role, isActive } = req.body;
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (role) user.role = role;
+    if (isActive !== undefined) user.isActive = isActive;
+    await user.save();
+    res.json({ user });
+  } catch (err) { next(err); }
+};
+
+exports.getAuditLogs = async (req, res, next) => {
+  try {
+    const { page = 1, limit = 50, category } = req.query;
+    const query = category ? { category } : {};
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [logs, total] = await Promise.all([
+      AuditLog.find(query)
+        .populate("performedBy", "name email role")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit)),
+      AuditLog.countDocuments(query),
+    ]);
+    res.json({ logs, total });
+  } catch (err) { next(err); }
+};
+
+exports.downloadAdmissionsCSV = async (req, res, next) => {
+  try {
+    const admissions = await Admission.find()
+      .populate("patientProfileId", "name demoId age gender")
+      .populate("wardId", "name")
+      .populate("bedId", "bedNumber")
+      .populate("latestPredictionId", "predictedLosDays riskCategory")
+      .sort({ admissionDate: -1 })
+      .limit(5000);
+
+    const rows = admissions.map(a => ({
+      id: a._id,
+      patient_demo_id: a.patientProfileId?.demoId || "",
+      patient_name: a.patientProfileId?.name || "",
+      age: a.patientProfileId?.age || "",
+      gender: a.patientProfileId?.gender || "",
+      admission_date: a.admissionDate?.toISOString().slice(0, 10) || "",
+      admission_type: a.admissionType,
+      medical_condition: a.medicalCondition,
+      insurance: a.insurance,
+      status: a.status,
+      ward: a.wardId?.name || "",
+      bed: a.bedId?.bedNumber || "",
+      predicted_los: a.latestPredictionId?.predictedLosDays || "",
+      risk_category: a.latestPredictionId?.riskCategory || "",
+      discharge_date: a.dischargeDate?.toISOString().slice(0, 10) || "",
+      actual_los: a.actualLos || "",
+    }));
+
+    const headers = Object.keys(rows[0] || {});
+    const csv = [headers.join(","), ...rows.map(r => headers.map(h => `"${r[h] ?? ""}"`).join(","))].join("\n");
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="admissions_${new Date().toISOString().slice(0,10)}.csv"`);
+    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
+    res.send(csv);
   } catch (err) { next(err); }
 };
